@@ -18,7 +18,7 @@ workflow:
 
 stages:
     - build
-    - deploy
+#    - deploy
 
 authenticate:
     stage: .pre
@@ -63,7 +63,9 @@ build:
         - docker tag ${algorithm_name} ${fullname}
         - docker push ${fullname}
 
-deploy:
-    stage: deploy
+# The deploy section would contain the needed code to deploy 
+# to specific service for specific cloud provider
+#deploy:
+#    stage: deploy
 
-    # Needed code to deploy to specific service for specific cloud provider
+    
