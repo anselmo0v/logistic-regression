@@ -1,0 +1,69 @@
+variables:
+    ALGORITHM_NAME: "logistic-regression"
+    COMMIT_DESCRIPTION: $CI_COMMIT_DESCRIPTION
+
+workflow:
+    rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event" 
+          when: never
+        - if: $CI_COMMIT_BRANCH == "dev"
+          variables:
+              ENV: "dev"
+        - if: $CI_COMMIT_BRANCH == "test"
+          variables:
+              ENV: "test"
+        - if: $CI_COMMIT_BRANCH == "master"
+          variables:
+              ENV: "prod"
+
+stages:
+    - build
+    - deploy
+
+authenticate:
+    stage: .pre
+
+    image: ubuntu:latest
+
+    environment:
+        name: ${ENV}
+
+    script:
+        - commit_description_split=(${COMMIT_DESCRIPTION[@]})
+        - echo ${commit_description_split[0]} > model_version.env
+    
+    artifacts:
+        paths:
+            - model_version.env
+
+build:
+    stage: build
+
+    image: 
+        name: docker:latest
+
+    services:
+        - docker:19-dind
+
+    environment:
+        name: ${ENV}
+
+    script:
+        ### Building
+        ## Loading credentials
+        - model_version=$(cat model_version.env)
+        - algorithm_name=${ALGORITHM_NAME}
+        - fullname=anselmo0v/logistic-regression:${ENV}-${model_version}
+
+        ## Docker image building
+        - docker build -q -t ${algorithm_name} .
+
+        ### Deployment
+        ## Docker image push to ECR
+        - docker tag ${algorithm_name} ${fullname}
+        - docker push ${fullname}
+
+deploy:
+    stage: deploy
+
+    # Needed code to deploy to specific service for specific cloud provider
