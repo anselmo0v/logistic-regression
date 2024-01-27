@@ -1,0 +1,6 @@
+# Ignoring cache
+__pycache__
+.pytest_cache
+tests
+__init__.py
+.gitignore

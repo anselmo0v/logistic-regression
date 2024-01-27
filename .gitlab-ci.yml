@@ -1,0 +1,187 @@
+# This file is a template, and might need editing before it works on your project.
+# To contribute improvements to CI/CD templates, please follow the Development guide at:
+# https://docs.gitlab.com/ee/development/cicd/templates.html
+# This specific template is located at:
+# https://gitlab.com/gitlab-org/gitlab/-/blob/master/lib/gitlab/ci/templates/Python.gitlab-ci.yml
+
+# Official language image. Look for the different tagged releases at:
+# https://hub.docker.com/r/library/python/tags/
+#image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+
+variables:
+    ALGORITHM_NAME: "bc-lambda-inference"
+    COMMIT_DESCRIPTION: $CI_COMMIT_DESCRIPTION
+
+workflow:
+    rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event" 
+          when: never
+        - if: $CI_COMMIT_BRANCH == "dev"
+          variables:
+              ENV: "dev"
+        - if: $CI_COMMIT_BRANCH == "test"
+          variables:
+              ENV: "test"
+        - if: $CI_COMMIT_BRANCH == "main"
+          variables:
+              ENV: "prod"
+
+stages:
+#    - test
+    - build
+    - deploy
+
+#test:
+#    stage: test
+#    script:
+#        - commit_description_split=(${COMMIT_DESCRIPTION[@]})
+#        - model_version=${commit_description_split[0]}
+#        - echo ${model_version}
+authenticate:
+    stage: .pre
+
+    image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+
+    environment:
+        name: ${ENV}
+
+    script:
+        - region=${AWS_DEFAULT_REGION}
+        - commit_description_split=(${COMMIT_DESCRIPTION[@]})
+        - echo ${commit_description_split[0]} > model_version.env
+        - echo $(aws ecr get-login-password --region ${region}) > pass.env 
+        - echo $(aws sts get-caller-identity --query Account --output text) > account.env
+    
+    artifacts:
+        paths:
+            - model_version.env
+            - pass.env
+            - account.env
+        
+
+build:
+    stage: build
+
+    image: 
+        name: docker:latest
+
+    services:
+        - docker:19-dind
+
+    environment:
+        name: ${ENV}
+
+    script:
+        ### Building
+        ## Loading credentials
+        - model_version=$(cat model_version.env)
+        - algorithm_name=${ALGORITHM_NAME}
+        - region=${AWS_DEFAULT_REGION}
+        - pass=$(cat pass.env)
+        - account=$(cat account.env)
+        - fullname=${account}.dkr.ecr.${region}.amazonaws.com/${algorithm_name}:${model_version}
+        ## Loging in to Registry
+        - docker logout
+        - docker login --username AWS -p ${pass} ${account}.dkr.ecr.${region}.amazonaws.com
+        ## Docker image building
+        - docker build -q -t ${algorithm_name} .
+
+        ### Deployment
+        ## Docker image push to ECR
+        - docker tag ${algorithm_name} ${fullname}
+        - docker push ${fullname}
+
+
+deploy:
+    stage: deploy
+
+    image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+
+    environment:
+        name: ${ENV}
+
+    script:
+        ### Loading credentials
+        - model_version=$(cat model_version.env)
+        - algorithm_name=${ALGORITHM_NAME}
+        - region=${AWS_DEFAULT_REGION}
+        - account=$(cat account.env)
+        - fullname=${account}.dkr.ecr.${region}.amazonaws.com/${algorithm_name}:${model_version}
+
+        ### Deployment
+        ## Lambda updating
+        - role=${LAMBDA_EXEC_ROLE}
+        - aws lambda update-function-code --region ${region} --function-name ${algorithm_name} --image-uri "${fullname}"
+
+
+update_ver_metadata:
+    stage: .post
+
+    image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+
+    environment:
+        name: ${ENV}
+
+    script:
+        ### Loading credentials
+        - model_version=$(cat model_version.env)
+        - process_table=${PROCESS_TABLE}
+        - history_table=${HISTORY_TABLE}
+        - process_id=${PROCESS_ID}
+        - account=$(cat account.env)
+        ## Creates 'key' json for dynamo commands
+        - key=$( jq -n --arg attr1 "${process_id}" '{id:{S:$attr1}}' )
+
+        ### Splits new model version into components
+        - model_ver1=${model_version:1:1}
+        - model_ver2=${model_version:3:1}
+        - model_ver3=${model_version:5:1}
+
+        ### Retrieves latest version for workflow
+        - workflow_version=$(aws dynamodb get-item --table-name "${process_table}" --key "${key}" --attributes-to-get "version")
+        - workflow_version_string=$(echo ${workflow_version} | jq '.Item' | jq '.version' | jq '.S')
+        ## Splits latest version into components
+        - IFS=. read -r workflow_ver1 workflow_ver2 workflow_ver3 <<< "$workflow_version_string"
+        - workflow_ver1=${workflow_ver1:2:1}
+        - workflow_ver3=${workflow_ver3:0:1}
+        - var1=${workflow_ver1}
+        - var2=${workflow_ver2}
+        - var3=${workflow_ver3}
+
+        ### Retrieves latest versions for lambda functions
+        - lambda_versions=$(aws dynamodb get-item --table-name "${process_table}" --key "${key}" --attributes-to-get "lambdaVersion")
+        - lambda_versions_string=$(echo ${lambda_versions} | jq '.Item' | jq '.lambdaVersion' | jq '.S')
+        - split_lambda=(${lambda_versions_string[@]})
+        ## Takes latest version for current lambda
+        - lambda_ver=${split_lambda[2]}
+        ## Splits latest version into components
+        - IFS=. read -r lambda_ver1 lambda_ver2 lambda_ver3 <<< "$lambda_ver"
+        - lambda_ver1=${lambda_ver1:3:1}
+        - lambda_ver3=${lambda_ver3:0:1}
+        ## Takes latest version for other lambdas in workflow
+        - lambda_postprocessing=${split_lambda[4]}
+        ## Splits latest version into components
+        - lambda_postprocessing_ver=${lambda_postprocessing:2:6}
+
+        ### Sets new version components
+        - if (("$model_ver1" > "$lambda_ver1")); then  var1=$((${workflow_ver1} + $((${model_ver1} - ${lambda_ver1})))); fi
+        - if (("$model_ver2" > "$lambda_ver2")); then  var2=$((${workflow_ver2} + $((${model_ver2} - ${lambda_ver2})))); fi
+        - if (("$model_ver3" > "$lambda_ver3")); then  var3=$((${workflow_ver3} + $((${model_ver3} - ${lambda_ver3})))); fi
+
+        ### Updates metadata tables in aws with new versions
+        ## Workflow
+        - new_workflow_version=v${var1}.${var2}.${var3}
+        - attribute=$( jq -n --arg attr2 "${new_workflow_version}" --arg attr1 "PUT" '{version:{Action:$attr1, Value:{S:$attr2}}}' )
+        - aws dynamodb update-item --table-name "${process_table}" --key "${key}" --attribute-updates "${attribute}"
+        ## Lambdas
+        - new_lambda_version=$( jq -n --arg attr1 "${model_version}" --arg attr2 "${lambda_postprocessing_ver}" '{"bc-lambda-inference":($attr1), "bc-lambda-postprocessing":($attr2)}' )
+        - attribute=$( jq -n --arg attr2 "${new_lambda_version}" --arg attr1 "PUT" '{lambdaVersion:{Action:$attr1, Value:{S:$attr2}}}' )
+        - aws dynamodb update-item --table-name "${process_table}" --key "${key}" --attribute-updates "${attribute}"
+        ## Insert new register to versioning history
+        - apt-get install uuid-runtime
+        - item_id=$(uuidgen)
+        - item=$( jq -n --arg attr1 "${item_id}" --arg attr2 "" --arg attr3 "${process_id}" --arg attr4 "${new_lambda_version}" --arg attr5 "${new_workflow_version}" '{id:{S:$attr1}, description:{S:$attr2}, idProcess:{S:$attr3}, lambdaVersion:{S:$attr4}, workflowVersion:{S:$attr5}}' )
+        - aws dynamodb put-item --table-name "${history_table}" --item "${item}"
+        ## Latest version id update
+        - attribute=$( jq -n --arg attr2 "${item_id}" --arg attr1 "PUT" '{idLatestVersion:{Action:$attr1, Value:{S:$attr2}}}' )
+        - aws dynamodb update-item --table-name "${process_table}" --key "${key}" --attribute-updates "${attribute}"
